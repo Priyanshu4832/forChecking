@@ -38,18 +38,25 @@ let receiving = {
   lastUiUpdate: 0
 };
 
-//new added
+// Queue for ICE candidates received before remote description is set
 let pendingCandidates = [];
 
 // Enhanced RTC configuration for better connectivity
 const RTC_CONFIG = {
   iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
+    // Google's Servers (your original ones)
+    // { urls: "stun:stun.l.google.com:19302" },
+    // { urls: "stun:stun1.l.google.com:19302" },
     // { urls: "stun:stun2.l.google.com:19302" },
-    // { urls: "stun:stun3.l.google.com:19302" },
-    // { urls: "stun:stun4.l.google.com:19302" },
-    // { urls: "stun:stun.services.mozilla.com:3478" }
+    { urls: "stun:stun3.l.google.com:19302" },
+    { urls: "stun:stun4.l.google.com:19302" },
+
+    // Other known public STUN servers
+    // { urls: "stun:stun.iptel.org" },
+    // { urls: "stun:stun.ideasip.com" },
+    // { urls: "stun:stun.sipnet.net:3478" },
+    // { urls: "stun:stun.rixtelecom.se" },
+    { urls: "stun:stun.services.mozilla.com:3478" }
   ],
   iceTransportPolicy: 'all',
   iceCandidatePoolSize: 10,
@@ -100,6 +107,8 @@ function formatTime(seconds) {
 
 // Reset connection cleanly
 function resetConnection() {
+  log("Resetting connection...");
+  
   if (dataChannel) {
     try { dataChannel.close(); } catch(e){}
     dataChannel = null;
@@ -108,6 +117,7 @@ function resetConnection() {
     try { pc.close(); } catch(e){}
     pc = null;
   }
+  
   receiving = { 
     active: false, 
     meta: null, 
@@ -121,28 +131,32 @@ function resetConnection() {
     speedUpdateInterval: null,
     lastUiUpdate: 0
   };
-  isInitiator = false;
+  
+  pendingCandidates = [];
+  //isInitiator = false;
+  
+  // Update UI state
+  if (window.updateUIState) {
+    window.updateUIState('disconnected');
+  }
 }
 
-
-
-
-//new added
 // Process queued ICE candidates
 function processPendingCandidates() {
-  if (!pc) return;
+  if (!pc || !pc.remoteDescription) {
+    log("Cannot process candidates - no PC or no remote description");
+    return;
+  }
+  
+  log(`Processing ${pendingCandidates.length} queued candidates`);
   
   while (pendingCandidates.length > 0) {
     const candidate = pendingCandidates.shift();
     pc.addIceCandidate(new RTCIceCandidate(candidate))
-      .then(() => log("Queued ICE candidate added"))
+      .then(() => log("Queued ICE candidate added successfully"))
       .catch(err => log("Error adding queued candidate: " + err.message));
   }
 }
-
-
-
-
 
 // --- Socket event handlers ---
 
@@ -221,6 +235,10 @@ document.getElementById("startBtn").onclick = async () => {
   log("Start clicked — creating PeerConnection as initiator");
   isInitiator = true;
   
+  if (window.updateUIState) {
+    window.updateUIState('connecting');
+  }
+  
   try {
     resetConnection();
     pc = new RTCPeerConnection(RTC_CONFIG);
@@ -230,15 +248,17 @@ document.getElementById("startBtn").onclick = async () => {
       ordered: true,
       maxRetransmits: null // reliable delivery
     });
+    //new addededed
+    dataChannel.bufferedAmountLowThreshold = 256 * 1024;
     setupDataChannelHandlers();
 
     // Set up ICE candidate handling
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        log("Sending ICE candidate");
+        log("Sending ICE candidate to paired peer");
         socket.emit("candidate", event.candidate);
       } else {
-        log("ICE gathering complete");
+        log("ICE gathering complete (null candidate)");
       }
     };
     
@@ -246,24 +266,41 @@ document.getElementById("startBtn").onclick = async () => {
       log(`PC connection state: ${pc.connectionState}`);
       if (pc.connectionState === 'failed') {
         appendMessage("❌ Connection failed. Try again.");
+        if (window.updateUIState) {
+          window.updateUIState('disconnected');
+        }
       } else if (pc.connectionState === 'connected') {
         appendMessage("✅ P2P connection established!");
+        if (window.updateUIState) {
+          window.updateUIState('connected');
+        }
       }
     };
     
     pc.oniceconnectionstatechange = () => {
       log(`ICE connection state: ${pc.iceConnectionState}`);
+      if (pc.iceConnectionState === 'failed') {
+        appendMessage("❌ ICE connection failed");
+        if (window.updateUIState) {
+          window.updateUIState('disconnected');
+        }
+      }
     };
 
     // Create and send offer
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
+    
+    log("Sending offer to paired peer");
     socket.emit("offer", offer);
     appendMessage("📤 Offer created & sent to paired peer.");
     
   } catch (err) {
     log("Start error: " + err.message);
     appendMessage("❌ Error starting connection: " + err.message);
+    if (window.updateUIState) {
+      window.updateUIState('disconnected');
+    }
   }
 };
 
@@ -274,14 +311,19 @@ socket.on("offer", async (offer) => {
     return;
   }
   
-  log("Received offer — answering");
+  log("Received offer — creating answer");
+  
+  if (window.updateUIState) {
+    window.updateUIState('connecting');
+  }
+  
   try {
     resetConnection();
     pc = new RTCPeerConnection(RTC_CONFIG);
     
     // Set up data channel handler for incoming channel
     pc.ondatachannel = (event) => {
-      log("Received data channel");
+      log("Received data channel from peer");
       dataChannel = event.channel;
       setupDataChannelHandlers();
     };
@@ -291,6 +333,8 @@ socket.on("offer", async (offer) => {
       if (event.candidate) {
         log("Sending ICE candidate (answerer)");
         socket.emit("candidate", event.candidate);
+      } else {
+        log("ICE gathering complete (answerer)");
       }
     };
     
@@ -298,29 +342,41 @@ socket.on("offer", async (offer) => {
       log(`PC connection state: ${pc.connectionState}`);
       if (pc.connectionState === 'failed') {
         appendMessage("❌ Connection failed. Try again.");
+        if (window.updateUIState) {
+          window.updateUIState('disconnected');
+        }
       } else if (pc.connectionState === 'connected') {
         appendMessage("✅ P2P connection established!");
+        if (window.updateUIState) {
+          window.updateUIState('connected');
+        }
       }
     };
 
-    // Set remote description and create answer
-    //old
-    // await pc.setRemoteDescription(new RTCSessionDescription(offer));
-    // const answer = await pc.createAnswer();
-    // await pc.setLocalDescription(answer);
-    // socket.emit("answer", answer);
-    // appendMessage("📤 Answer created & sent.");
+    pc.oniceconnectionstatechange = () => {
+      log(`ICE connection state: ${pc.iceConnectionState}`);
+    };
 
-
-    //new added
     // Set remote description and create answer
     await pc.setRemoteDescription(new RTCSessionDescription(offer));
-    processPendingCandidates(); // ADD THIS LINE
+    log("Remote description (offer) set successfully");
+    
+    // Process any queued candidates
+    processPendingCandidates();
+    
     const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    
+    log("Sending answer to peer");
+    socket.emit("answer", answer);
+    appendMessage("📤 Answer created & sent.");
     
   } catch (err) {
     log("Offer handling error: " + err.message);
     appendMessage("❌ Error handling offer: " + err.message);
+    if (window.updateUIState) {
+      window.updateUIState('disconnected');
+    }
   }
 });
 
@@ -336,140 +392,89 @@ socket.on("answer", async (answer) => {
       log("No PC when answer arrived"); 
       return; 
     }
-    //old
-    // await pc.setRemoteDescription(new RTCSessionDescription(answer));
-    // appendMessage("📥 Answer received - connection establishing...");
-
-    //new added
+    
+    log("Received answer from peer");
     await pc.setRemoteDescription(new RTCSessionDescription(answer));
-    processPendingCandidates(); // ADD THIS LINE
+    log("Remote description (answer) set successfully");
+    
+    // Process any queued candidates
+    processPendingCandidates();
+    
     appendMessage("📥 Answer received - connection establishing...");
+    
+    // Add a delayed check for data channel status
+    setTimeout(() => {
+      debugConnectionStatus();
+      if (pc && pc.connectionState === 'connected' && (!dataChannel || dataChannel.readyState !== 'open')) {
+        log("⚠️ PC connected but data channel not open - this might be a timing issue");
+      }
+    }, 3000);
+    
   } catch (err) {
     log("Error applying answer: " + err.message);
     appendMessage("❌ Error applying answer: " + err.message);
+    if (window.updateUIState) {
+      window.updateUIState('disconnected');
+    }
   }
 });
 
 // Handle ICE candidates
-//new added
-
-// Handle ICE candidates
-//old
-// socket.on("candidate", async (candidate) => {
-//   try {
-//     if (!pc) { 
-//       log("Candidate received but no PC yet - queuing"); 
-//       pendingCandidates.push(candidate);
-//       return; 
-//     }
-    
-//     if (pc.remoteDescription) {
-//       await pc.addIceCandidate(new RTCIceCandidate(candidate));
-//       log("ICE candidate added");
-//     } else {
-//       // Queue candidate until remote description is set
-//       pendingCandidates.push(candidate);
-//       log("Remote description not set - candidate queued");
-//     }
-//   } catch (err) {
-//     log("addIceCandidate error: " + err.message);
-//   }
-// });
-
-
-
-socket.on("offer", async (offer) => {
-  if (isInitiator) {
-    log("Ignoring offer - we are the initiator");
-    return;
-  }
-  
-  log("Received offer — answering");
+socket.on("candidate", async (candidate) => {
   try {
-    resetConnection();
-    pc = new RTCPeerConnection(RTC_CONFIG);
+    if (!pc) { 
+      log("Candidate received but no PC yet - discarding"); 
+      return; 
+    }
     
-    // Set up data channel handler for incoming channel
-    pc.ondatachannel = (event) => {
-      log("Received data channel");
-      dataChannel = event.channel;
-      setupDataChannelHandlers();
-    };
-
-    // Set up ICE candidate handling
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        log("Sending ICE candidate (answerer)");
-        socket.emit("candidate", event.candidate);
-      }
-    };
-    
-    pc.onconnectionstatechange = () => {
-      log(`PC connection state: ${pc.connectionState}`);
-      if (pc.connectionState === 'failed') {
-        appendMessage("❌ Connection failed. Try again.");
-      } else if (pc.connectionState === 'connected') {
-        appendMessage("✅ P2P connection established!");
-      }
-    };
-
-    // Set remote description and create answer
-    await pc.setRemoteDescription(new RTCSessionDescription(offer));
-    processPendingCandidates();
-    const answer = await pc.createAnswer();
-    
-    // ==== MISSING LINES - ADD THESE ====
-    await pc.setLocalDescription(answer);
-    socket.emit("answer", answer);
-    appendMessage("📤 Answer created & sent.");
-    // ===================================
-    
+    if (pc.remoteDescription) {
+      // Remote description is set, add candidate immediately
+      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      log("ICE candidate added immediately");
+    } else {
+      // Queue candidate until remote description is set
+      pendingCandidates.push(candidate);
+      log(`Remote description not set - candidate queued (${pendingCandidates.length} total)`);
+    }
   } catch (err) {
-    log("Offer handling error: " + err.message);
-    appendMessage("❌ Error handling offer: " + err.message);
+    log("addIceCandidate error: " + err.message);
   }
 });
-
-
-
-//old
-// socket.on("candidate", async (candidate) => {
-//   try {
-//     if (!pc) { 
-//       log("Candidate received but no PC yet - queuing"); 
-//       return; 
-//     }
-//     if (pc.remoteDescription) {
-//       await pc.addIceCandidate(new RTCIceCandidate(candidate));
-//       log("ICE candidate added");
-//     } else {
-//       log("Remote description not set yet - candidate dropped");
-//     }
-//   } catch (err) {
-//     log("addIceCandidate error: " + err.message);
-//   }
-// });
-
-
-
 
 // --- Data Channel Management ---
 function setupDataChannelHandlers() {
-  if (!dataChannel) return;
+  if (!dataChannel) {
+    log("setupDataChannelHandlers called but no dataChannel");
+    return;
+  }
+  
+  log("Setting up data channel handlers");
   
   dataChannel.onopen = () => {
-    log("DataChannel opened");
+    log("✅ DataChannel OPENED successfully!");
     appendMessage("✅ Data channel ready — you can send files and chat!");
+    
+    if (window.updateUIState) {
+      window.updateUIState('connected');
+    }
   };
   
   dataChannel.onclose = () => {
-    log("DataChannel closed");
+    log("❌ DataChannel closed");
     appendMessage("❌ Data channel closed");
+    
+    if (window.updateUIState) {
+      window.updateUIState('disconnected');
+    }
   };
   
   dataChannel.onerror = (err) => {
-    log("DataChannel error: " + (err && err.message ? err.message : err));
+    log("❌ DataChannel error: " + (err && err.message ? err.message : err));
     appendMessage("❌ Data channel error occurred");
+    
+    if (window.updateUIState) {
+      window.updateUIState('disconnected');
+    }
   };
 
   dataChannel.onmessage = async (event) => {
@@ -521,7 +526,7 @@ function startFileReceive(msg) {
   receiving.meta = {
     fileName: msg.fileName,
     fileSize: msg.fileSize,
-    chunkSize: msg.chunkSize || 64*1024,
+    chunkSize: msg.chunkSize || 16*1024,
     fileType: msg.fileType || "application/octet-stream",
     totalChunks: Math.ceil(msg.fileSize / (msg.chunkSize || 64*1024))
   };
@@ -546,36 +551,48 @@ function startFileReceive(msg) {
   updateReceiveSpeed();
 }
 
-function handleFramedChunk(arrayBuffer) {
+let receiveBuffer = new Uint8Array(0);
+
+function handleFramedChunk(newData) {
   if (!receiving.active) return;
-  if (arrayBuffer.byteLength < CHUNK_HEADER_BYTES) return;
 
-  const dv = new DataView(arrayBuffer, 0, CHUNK_HEADER_BYTES);
-  const magic = dv.getUint32(0, false);
-  if (magic !== CHUNK_MAGIC) return;
-  
-  const idx = dv.getUint32(4, false);
-  const len = dv.getUint32(8, false);
+  // Append new data to buffer
+  const tmp = new Uint8Array(receiveBuffer.length + newData.byteLength);
+  tmp.set(receiveBuffer, 0);
+  tmp.set(new Uint8Array(newData), receiveBuffer.length);
+  receiveBuffer = tmp;
 
-  if (arrayBuffer.byteLength < CHUNK_HEADER_BYTES + len) {
-    log(`Chunk ${idx} length mismatch`);
-    return;
-  }
-
-  const chunkData = arrayBuffer.slice(CHUNK_HEADER_BYTES, CHUNK_HEADER_BYTES + len);
-
-  if (!receiving.chunks.has(idx)) {
-    receiving.chunks.set(idx, chunkData);
-    receiving.receivedBytes += len;
-    
-    // Update speed display
-    const now = Date.now();
-    if (!receiving.lastUiUpdate || now - receiving.lastUiUpdate > 200) {
-      updateReceiveSpeed();
-      receiving.lastUiUpdate = now;
+  // Process as many complete chunks as possible
+  while (receiveBuffer.length >= CHUNK_HEADER_BYTES) {
+    const dv = new DataView(receiveBuffer.buffer, receiveBuffer.byteOffset, receiveBuffer.byteLength);
+    const magic = dv.getUint32(0, false);
+    if (magic !== CHUNK_MAGIC) {
+      console.error("Bad magic in chunk, resetting buffer");
+      receiveBuffer = new Uint8Array(0);
+      return;
     }
+
+    const idx = dv.getUint32(4, false);
+    const len = dv.getUint32(8, false);
+
+    if (receiveBuffer.length < CHUNK_HEADER_BYTES + len) {
+      // Not enough data yet → wait for next onmessage
+      break;
+    }
+
+    // Extract chunk
+    const chunkData = receiveBuffer.slice(CHUNK_HEADER_BYTES, CHUNK_HEADER_BYTES + len);
+
+    if (!receiving.chunks.has(idx)) {
+      receiving.chunks.set(idx, chunkData);
+      receiving.receivedBytes += len;
+    }
+
+    // Remove processed bytes
+    receiveBuffer = receiveBuffer.slice(CHUNK_HEADER_BYTES + len);
   }
 }
+
 
 function updateReceiveSpeed() {
   if (!receiving.active || !receiving.startTime) return;
@@ -725,9 +742,14 @@ async function sendFile(file) {
   try {
     while (offset < file.size) {
       // Backpressure management
-      if (dataChannel.bufferedAmount > 512 * 1024) {
-        await new Promise(r => setTimeout(r, 10));
-        continue;
+      if (dataChannel.bufferedAmount > dataChannel.bufferedAmountLowThreshold) {
+        await new Promise(res => {
+          const resume = () => {
+            dataChannel.removeEventListener("bufferedamountlow", resume);
+            res();
+          };
+          dataChannel.addEventListener("bufferedamountlow", resume);
+        });
       }
 
       const end = Math.min(offset + chunkSize, file.size);
@@ -754,20 +776,22 @@ async function sendFile(file) {
       const elapsed = Math.max(0.001, (Date.now() - start) / 1000);
       const speed = formatSpeed(offset / elapsed);
       const progress = Math.round((offset / file.size) * 100);
-      document.getElementById("fileStatus").innerText = `Sending ${file.name}... ${progress}% (${speed})`;
+      document.getElementById("fileStatus").innerText =
+        `Sending ${file.name}... ${progress}% (${speed})`;
     }
 
     // Send completion signal
     dataChannel.send(JSON.stringify({ type: "file_end", fileName: file.name }));
-    
+
     const elapsed = (Date.now() - start) / 1000;
     appendMessage(`✅ Sent ${file.name} (${formatFileSize(file.size)}) in ${elapsed.toFixed(1)}s`);
     document.getElementById("fileStatus").innerText = `File sent: ${file.name}`;
-    
+
   } catch (err) {
     log("sendFile error: " + err.message);
     appendMessage("❌ Error sending file: " + err.message);
   }
+
 }
 
 // --- Chat Functionality ---
